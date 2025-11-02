@@ -1,4 +1,5 @@
   release:
+    if: ${{ secrets.EEVEEDECRYPTER_API_KEY != '' }}   # ← add this line
     needs: build
     permissions:
       contents: write
