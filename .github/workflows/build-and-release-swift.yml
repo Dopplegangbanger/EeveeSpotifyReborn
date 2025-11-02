@@ -1,14 +1,14 @@
-  release:
-    if: ${{ secrets.EEVEEDECRYPTER_API_KEY != '' }}   # ← add this line
-    needs: build
-    permissions:
-      contents: write
-    runs-on: macos-14
-    defaults:
-      run:
-        shell: zsh {0}
-    steps:
-      - uses: actions/checkout@v4
+release:
+  if: ${{ secrets.EEVEEDECRYPTER_API_KEY != '' }}
+  needs: build
+  permissions:
+    contents: write
+  runs-on: macos-14
+  defaults:
+    run:
+      shell: zsh {0}
+  steps:
+    - uses: actions/checkout@v4
 
       - name: Ensure tools
         run: |
