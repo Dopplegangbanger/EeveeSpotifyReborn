@@ -66,3 +66,186 @@ jobs:
           if-no-files-found: error
 
       - name: Build EeveeSpotify (rootless)
+        run: |
+          set -euo pipefail
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          echo "FILENAME_ROOTLESS=$(find packages -maxdepth 1 -type f -name '*arm64*.deb' -exec basename {} \; | head -n1)" >> $GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILENAME_ROOTLESS }}
+          path: packages/${{ env.FILENAME_ROOTLESS }}
+          if-no-files-found: error
+
+  release:
+    if: ${{ secrets.EEVEEDECRYPTER_API_KEY != '' }}
+    needs: build
+    permissions:
+      contents: write
+    runs-on: macos-14
+    defaults:
+      run:
+        shell: zsh {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure tools
+        run: |
+          set -euo pipefail
+          brew update
+          brew install wget jq xz
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Set EeveeSpotify Versions
+        run: |
+          set -euo pipefail
+          EEVEESPOTIFY_ROOTFUL=$(echo *iphoneos-arm.deb)
+          EEVEESPOTIFY_ROOTLESS=$(echo *iphoneos-arm64.deb)
+          EEVEESPOTIFY_VERSION=${${(s:_:)EEVEESPOTIFY_ROOTFUL}[2]}
+          echo "EEVEESPOTIFY_ROOTFUL=$EEVEESPOTIFY_ROOTFUL" >> $GITHUB_ENV
+          echo "EEVEESPOTIFY_ROOTLESS=$EEVEESPOTIFY_ROOTLESS" >> $GITHUB_ENV
+          echo "EEVEESPOTIFY_VERSION=$EEVEESPOTIFY_VERSION" >> $GITHUB_ENV
+
+      - name: Download SwiftProtobuf
+        run: |
+          set -euo pipefail
+          wget -q https://github.com/whoeevee/swift-protobuf/releases/download/${{ env.SWIFTPROTOBUF_VERSION }}/org.swift.protobuf.swiftprotobuf_${{ env.SWIFTPROTOBUF_VERSION }}_iphoneos-arm.deb
+          wget -q https://github.com/whoeevee/swift-protobuf/releases/download/${{ env.SWIFTPROTOBUF_VERSION }}/org.swift.protobuf.swiftprotobuf_${{ env.SWIFTPROTOBUF_VERSION }}_iphoneos-arm64.deb
+          echo "SWIFTPROTOBUF_ROOTFUL=org.swift.protobuf.swiftprotobuf_${{ env.SWIFTPROTOBUF_VERSION }}_iphoneos-arm.deb" >> $GITHUB_ENV
+          echo "SWIFTPROTOBUF_ROOTLESS=org.swift.protobuf.swiftprotobuf_${{ env.SWIFTPROTOBUF_VERSION }}_iphoneos-arm64.deb" >> $GITHUB_ENV
+
+      - name: Download OpenSpotifySafariExtension
+        run: |
+          set -euo pipefail
+          git clone https://github.com/BillyCurtis/OpenSpotifySafariExtension
+          echo "OPENSPOTIFYSAFARIEXTENSION=OpenSpotifySafariExtension/OpenSpotifySafariExtension.appex" >> $GITHUB_ENV
+
+      - name: Download Decrypted Spotify Package
+        env:
+          API_KEY: ${{ secrets.EEVEEDECRYPTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${API_KEY:-}" ]]; then
+            echo "::warning::EEVEEDECRYPTER_API_KEY is not set. Skipping decrypt/download."
+            exit 78
+          fi
+          response=$(curl -fsSL "https://decrypt.whoeevee.com/decrypted?appId=324684580&apiKey=${API_KEY}" || true)
+          if [[ -z "$response" ]]; then
+            echo "::error::Decrypter API returned empty response."
+            exit 78
+          fi
+          link=$(printf '%s' "$response" | jq -r '.link // empty')
+          if [[ -z "$link" ]]; then
+            echo "::error::Decrypter API did not include a 'link'."
+            echo "$response"
+            exit 78
+          fi
+          echo "Downloading Spotify IPA from: $link"
+          curl -fL --retry 3 --output spotify.ipa "$link"
+          base=$(basename "$link")
+          ver="${base%-*.ipa}"
+          ver="${ver#*-}"
+          echo "SPOTIFY_VERSION=$ver" >> $GITHUB_ENV
+          echo "SPOTIFY_PACKAGE=spotify.ipa" >> $GITHUB_ENV
+
+      - name: Setup insert-dylib
+        if: env.SPOTIFY_PACKAGE
+        run: |
+          set -euo pipefail
+          git clone https://github.com/Tyilo/insert_dylib.git
+          xcrun clang -x c -arch arm64 ./insert_dylib/insert_dylib/main.c -I/usr/include/ -o insert-dylib
+          sudo mv insert-dylib /usr/local/bin/
+          sudo chmod +x /usr/local/bin/insert-dylib
+
+      - name: Setup ivinject
+        if: env.SPOTIFY_PACKAGE
+        run: |
+          set -euo pipefail
+          git clone https://github.com/whoeevee/ivinject.git
+          mkdir -p ~/.ivinject
+          cp -r ./ivinject/KnownFrameworks ~/.ivinject
+          wget -q https://github.com/whoeevee/ivinject/releases/download/first/ivinject-arm64
+          sudo mv ivinject-arm64 /usr/local/bin/
+          sudo chmod +x /usr/local/bin/ivinject-arm64
+
+      - name: Setup ipapatch
+        if: env.SPOTIFY_PACKAGE
+        run: |
+          set -euo pipefail
+          wget -q https://github.com/asdfzxcvbn/ipapatch/releases/download/v2.1.0/ipapatch.macos-arm64
+          sudo mv ipapatch.macos-arm64 /usr/local/bin/ipapatch
+          sudo chmod +x /usr/local/bin/ipapatch
+
+      - name: Check Version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST_EEVEESPOTIFY_VERSION=$(gh release list --limit 1 --json tagName --jq '.[0].tagName[5:]' || true)
+          echo "LATEST_EEVEESPOTIFY_VERSION=$LATEST_EEVEESPOTIFY_VERSION" >> $GITHUB_ENV
+
+      - name: Create EeveeSpotify Package
+        if: env.SPOTIFY_PACKAGE
+        run: |
+          set -euo pipefail
+          EEVEESPOTIFY_PACKAGE="EeveeSpotify-${EEVEESPOTIFY_VERSION}-${SPOTIFY_VERSION}.ipa"
+          echo "EEVEESPOTIFY_PACKAGE=$EEVEESPOTIFY_PACKAGE" >> $GITHUB_ENV
+          ivinject-arm64 "$SPOTIFY_PACKAGE" "$EEVEESPOTIFY_PACKAGE" \
+            -i "$EEVEESPOTIFY_ROOTFUL" "$SWIFTPROTOBUF_ROOTFUL" "$OPENSPOTIFYSAFARIEXTENSION" \
+            -s - -d --level Optimal
+
+      - name: Create Patched Package
+        if: env.EEVEESPOTIFY_PACKAGE
+        run: |
+          set -euo pipefail
+          EEVEESPOTIFY_PATCHED_PACKAGE="EeveeSpotify-${EEVEESPOTIFY_VERSION}-${SPOTIFY_VERSION}-patched.ipa"
+          echo "EEVEESPOTIFY_PATCHED_PACKAGE=$EEVEESPOTIFY_PATCHED_PACKAGE" >> $GITHUB_ENV
+          ipapatch -input "$EEVEESPOTIFY_PACKAGE" -output "$EEVEESPOTIFY_PATCHED_PACKAGE"
+
+      - name: Compose Changelog
+        if: env.LATEST_EEVEESPOTIFY_VERSION != env.EEVEESPOTIFY_VERSION
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          last_update_repo_date=$(git log --grep="bump" --format=%cI | sed -n 2p || true)
+          CHANGELOG=""
+          gh pr list --state merged --search "merged:>${last_update_repo_date}" --json files,author \
+            | jq -r '.[] | "\(.author.login) \(.files[0].path)"' \
+            | tail -r \
+            | while read -r login file; do
+                lang_code=$(echo "$file" | grep -oE '/([a-zA-Z-]+)\.lproj/' | sed -E 's|/([a-zA-Z-]+)\.lproj/|\1|')
+                lang_name=$(echo "import Foundation; print(Locale.current.localizedString(forIdentifier: \"$lang_code\") ?? \"\")" | swift -)
+                [[ -z "$lang_name" ]] && continue
+                CHANGELOG+="* Updated ${lang_name} localization by @${login}"$'\n'
+              done
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          echo "$CHANGELOG" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create Release
+        if: env.LATEST_EEVEESPOTIFY_VERSION != env.EEVEESPOTIFY_VERSION
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tag_name: swift${{ env.EEVEESPOTIFY_VERSION }}
+          release_name: Swift ${{ env.EEVEESPOTIFY_VERSION }}
+          body: ${{ env.CHANGELOG }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Packages (to GitHub Release)
+        if: env.LATEST_EEVEESPOTIFY_VERSION != env.EEVEESPOTIFY_VERSION
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "swift$EEVEESPOTIFY_VERSION" \
+            "$EEVEESPOTIFY_ROOTFUL" "$EEVEESPOTIFY_ROOTLESS" \
+            "$SWIFTPROTOBUF_ROOTFUL" "$SWIFTPROTOBUF_ROOTLESS" \
+            --clobber
